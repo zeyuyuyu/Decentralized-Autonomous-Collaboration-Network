@@ -1,83 +1,119 @@
 import hashlib
-from typing import List, Dict, Set
+import time
+from typing import List, Dict, Optional
 from dataclasses import dataclass
-from time import time
 
 @dataclass
-class Message:
-    sender: str
-    value: any
+class ConsensusMessage:
+    node_id: str
     timestamp: float
+    data: Dict
     signature: str
 
 class ByzantineConsensus:
     def __init__(self, node_id: str, private_key: str):
         self.node_id = node_id
         self.private_key = private_key
-        self.messages: Dict[str, Set[Message]] = {}
-        self.decided_values: Dict[str, any] = {}
-        self.round = 0
-        self.f = 0  # Max Byzantine nodes tolerated
+        self.peers: List[str] = []
+        self.leader: Optional[str] = None
+        self.view_number = 0
+        self.messages: List[ConsensusMessage] = []
+        self.quorum_size = 0
 
-    def sign_message(self, value: any) -> str:
-        message = f"{self.node_id}:{value}:{time()}"
+    def sign_message(self, data: Dict) -> str:
+        message = f"{self.node_id}:{time.time()}:{str(data)}"
         return hashlib.sha256(
             (message + self.private_key).encode()
         ).hexdigest()
 
-    def broadcast_value(self, value: any) -> Message:
-        msg = Message(
-            sender=self.node_id,
-            value=value,
-            timestamp=time(),
-            signature=self.sign_message(value)
-        )
-        self._process_message(msg)
-        return msg
-
-    def receive_message(self, message: Message) -> bool:
-        if not self._verify_message(message):
-            return False
-        return self._process_message(message)
-
-    def _verify_message(self, message: Message) -> bool:
-        # Verify message signature and timestamp
+    def verify_message(self, message: ConsensusMessage) -> bool:
         # In production, implement proper cryptographic verification
-        return True
+        return len(message.signature) == 64
 
-    def _process_message(self, message: Message) -> bool:
-        round_key = str(self.round)
-        if round_key not in self.messages:
-            self.messages[round_key] = set()
+    def elect_leader(self) -> str:
+        """Elect leader using a deterministic algorithm based on view number"""
+        if not self.peers:
+            return self.node_id
+        all_nodes = sorted(self.peers + [self.node_id])
+        leader_index = self.view_number % len(all_nodes)
+        return all_nodes[leader_index]
+
+    def start_consensus_round(self, proposal: Dict) -> bool:
+        """Initiate a new consensus round"""
+        self.messages.clear()
         
-        self.messages[round_key].add(message)
+        if self.node_id == self.elect_leader():
+            # Leader behavior
+            signature = self.sign_message(proposal)
+            prepare_msg = ConsensusMessage(
+                node_id=self.node_id,
+                timestamp=time.time(),
+                data=proposal,
+                signature=signature
+            )
+            self.broadcast_message(prepare_msg)
+            return self.collect_votes(prepare_msg)
+        else:
+            # Follower behavior
+            return self.participate_consensus()
+
+    def collect_votes(self, proposal: ConsensusMessage) -> bool:
+        """Leader collects and validates votes from peers"""
+        votes = 1  # Count self vote
+        timeout = time.time() + 30  # 30 second timeout
         
-        # Check if we have enough messages to reach consensus
-        if len(self.messages[round_key]) >= 2 * self.f + 1:
-            self._try_decide(round_key)
-        return True
+        while time.time() < timeout:
+            for msg in self.messages:
+                if self.verify_message(msg) and msg.data == proposal.data:
+                    votes += 1
+                    if votes >= self.quorum_size:
+                        return True
+            time.sleep(0.1)
+        
+        self.trigger_view_change()
+        return False
 
-    def _try_decide(self, round_key: str) -> None:
-        if round_key in self.decided_values:
-            return
+    def participate_consensus(self) -> bool:
+        """Follower participation in consensus"""
+        timeout = time.time() + 30
+        
+        while time.time() < timeout:
+            for msg in self.messages:
+                if msg.node_id == self.leader and self.verify_message(msg):
+                    vote = ConsensusMessage(
+                        node_id=self.node_id,
+                        timestamp=time.time(),
+                        data=msg.data,
+                        signature=self.sign_message(msg.data)
+                    )
+                    self.broadcast_message(vote)
+                    return True
+            time.sleep(0.1)
+        
+        self.trigger_view_change()
+        return False
 
-        # Count message values
-        value_counts: Dict[any, int] = {}
-        for msg in self.messages[round_key]:
-            if msg.value not in value_counts:
-                value_counts[msg.value] = 0
-            value_counts[msg.value] += 1
+    def trigger_view_change(self) -> None:
+        """Initiate view change when consensus fails"""
+        self.view_number += 1
+        self.leader = self.elect_leader()
+        self.messages.clear()
 
-        # Check if any value has more than 2f+1 votes
-        for value, count in value_counts.items():
-            if count >= 2 * self.f + 1:
-                self.decided_values[round_key] = value
-                self.round += 1
-                break
+    def broadcast_message(self, message: ConsensusMessage) -> None:
+        """Broadcast message to all peers"""
+        self.messages.append(message)
+        # In production, implement actual network broadcast
 
-    def get_consensus_value(self, round_key: str) -> any:
-        return self.decided_values.get(round_key)
+    def add_peer(self, peer_id: str) -> None:
+        """Add new peer to the network"""
+        if peer_id not in self.peers and peer_id != self.node_id:
+            self.peers.append(peer_id)
+            self.quorum_size = (len(self.peers) + 1) * 2 // 3 + 1
 
-    def set_fault_tolerance(self, f: int) -> None:
-        """Set the number of Byzantine nodes that can be tolerated"""
-        self.f = f
+    def remove_peer(self, peer_id: str) -> None:
+        """Remove peer from the network"""
+        if peer_id in self.peers:
+            self.peers.remove(peer_id)
+            self.quorum_size = (len(self.peers) + 1) * 2 // 3 + 1
+            if peer_id == self.leader:
+                self.trigger_view_change()
